@@ -161,16 +161,44 @@ Since `goodlinks2insta` is installed as a uv tool, it's available on your PATH a
 - Duplicate URLs in GoodLinks are sent once.
 - `--skip-urls FILE` takes a file of URLs (one per line) that are already in Instapaper; matching links are recorded as synced without being sent.
 
-## Sync state in iCloud
+## Sharing the sync record between Macs
 
-The record of what has been sent (`synced.json`) lives in iCloud Drive at `iCloud Drive/goodlinks2insta/synced.json`, so every Mac sees the same history and won't re-send links another Mac already sent. On first run, an existing local `~/Library/Application Support/goodlinks2insta/synced.json` is moved there (the old file is renamed `synced.json.migrated`). Set `"state_file"` in the config to use another location.
+The sync record (`synced.json`) lists every GoodLinks link that has been sent to Instapaper (or deliberately skipped). If you sync from more than one Mac, every Mac has to read **the same** record, or each one will re-send links the others already sent.
 
-Safeguards:
-- If iCloud has offloaded the file to save space, the tool downloads it before syncing.
-- If no state file exists at all and more than 25 links would be sent, the sync refuses (so a new Mac can't flood Instapaper). Run `goodlinks2insta reset` or pass `--allow-full-sync` when a full sync is intended.
-- `reset` writes an empty state file rather than deleting it, so the reset reaches every Mac.
+`goodlinks2insta status` shows which record a Mac is using on its `State:` line. Check that it's the same path on every Mac.
 
-iCloud takes a few minutes to propagate, so schedule automatic syncs on one Mac; manual runs on the other are then safe.
+### Where the record lives
+
+1. **`state_file` in the config**, if set. Use this to put the record in any folder that syncs between your Macs, such as Dropbox:
+
+   ```json
+   "state_file": "~/Library/CloudStorage/Dropbox/goodlinks2insta/synced.json"
+   ```
+
+   Set the same `state_file` on every Mac. Check the folder name with `ls ~/Library/CloudStorage/` first; with more than one Dropbox account it may be `Dropbox-Personal` or similar, and older Dropbox installs use `~/Dropbox`.
+2. **Otherwise, iCloud Drive**: `iCloud Drive/goodlinks2insta/synced.json`, if iCloud Drive is turned on for that Mac.
+3. **Otherwise, a local file** at `~/Library/Application Support/goodlinks2insta/synced.json`. This record is **not shared**, and the tool prints a warning on every run. That happens on Macs where iCloud Drive is off, for example a work Mac managed by an IT department; use `state_file` there instead.
+
+### Moving to a shared record
+
+When a Mac first uses a shared location that doesn't have a record yet, its local `~/Library/Application Support/goodlinks2insta/synced.json` is copied there and the local file is renamed `synced.json.migrated`, so it can't be used by mistake later.
+
+To set up a second Mac, or switch both Macs to Dropbox:
+
+1. On the Mac with the up-to-date record, copy it to the shared folder (find its current path on the `State:` line of `goodlinks2insta status`).
+2. On every Mac, set `state_file` in the config to that shared path.
+3. On every Mac, run `goodlinks2insta status`. The `State:`, `Synced:` and `Pending:` lines should match. Don't run `sync` on a Mac until they do.
+
+Do step 1 before setting `state_file` on any other Mac. Otherwise that Mac may copy its own, possibly out-of-date, record into the shared folder first.
+
+### Safeguards
+
+- If iCloud has offloaded the record to save space, the tool downloads it before syncing.
+- If there's no record at all and more than 25 links would be sent, `sync` refuses, so a new or misconfigured Mac can't flood Instapaper. Run `goodlinks2insta reset` or pass `--allow-full-sync` when a full sync is intended.
+- `reset` writes an empty record rather than deleting it, so the reset reaches every Mac.
+- When saving, the tool merges its list with what's already in the record, so a Mac doesn't erase entries another Mac added.
+
+Dropbox and iCloud take a little while to copy changes between Macs, so schedule automatic syncs on only one Mac. Running `sync` by hand on another Mac is then safe.
 
 ## Config
 
@@ -184,7 +212,7 @@ iCloud takes a few minutes to propagate, so schedule automatic syncs on one Mac;
   "sync_delay": 5,
   "include_read": false,
   "log_file": "~/Library/Logs/goodlinks2insta.log",
-  "state_file": "~/Library/Mobile Documents/com~apple~CloudDocs/goodlinks2insta/synced.json"
+  "state_file": "~/Library/CloudStorage/Dropbox/goodlinks2insta/synced.json"
 }
 ```
 
@@ -195,9 +223,9 @@ iCloud takes a few minutes to propagate, so schedule automatic syncs on one Mac;
 | `sync_delay` | `5` | Seconds to wait after launching GoodLinks so it can pull new links from iCloud. |
 | `include_read` | `false` | Also send links already marked read in GoodLinks. |
 | `log_file` | `~/Library/Logs/goodlinks2insta.log` | Where every run is logged, including `--quiet` runs. |
-| `state_file` | iCloud Drive `goodlinks2insta/synced.json` (or `~/Library/Application Support/goodlinks2insta/synced.json` without iCloud Drive) | Where the record of sent links is kept. |
+| `state_file` | iCloud Drive `goodlinks2insta/synced.json`, or `~/Library/Application Support/goodlinks2insta/synced.json` (not shared) when iCloud Drive is off | Where the record of sent links is kept. Set the same path on every Mac; see [Sharing the sync record between Macs](#sharing-the-sync-record-between-macs). |
 
-Only `username` and `password` are required; leave out any other key to use its default. The config file is per Mac and isn't shared through iCloud, so run `init` on each Mac.
+Only `username` and `password` are required; leave out any other key to use its default. The config file is per Mac and isn't shared, so run `init` and set `state_file` on each Mac.
 
 ## Uninstalling the tool
 
