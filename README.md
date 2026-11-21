@@ -111,6 +111,24 @@ rm ~/Library/LaunchAgents/com.sidget.goodlinks2insta.plist
 
 Since `goodlinks2insta` is installed as a uv tool, it's available on your PATH and can be called directly from anywhere.
 
+## What gets synced
+
+- Only links that are **unread** in GoodLinks are sent (set `"include_read": true` in the config, or pass `--include-read`, to send everything).
+- Links are sent **oldest-saved first**, about one per second, so the newest GoodLinks saves end up at the top of Instapaper.
+- Duplicate URLs in GoodLinks are sent once.
+- `--skip-urls FILE` takes a file of URLs (one per line) that are already in Instapaper; matching links are recorded as synced without being sent.
+
+## Sync state in iCloud
+
+The record of what has been sent (`synced.json`) lives in iCloud Drive at `iCloud Drive/goodlinks2insta/synced.json`, so every Mac sees the same history and won't re-send links another Mac already sent. On first run, an existing local `~/Library/Application Support/goodlinks2insta/synced.json` is moved there (the old file is renamed `synced.json.migrated`). Set `"state_file"` in the config to use another location.
+
+Safeguards:
+- If iCloud has offloaded the file to save space, the tool downloads it before syncing.
+- If no state file exists at all and more than 25 links would be sent, the sync refuses (so a new Mac can't flood Instapaper). Run `goodlinks2insta reset` or pass `--allow-full-sync` when a full sync is intended.
+- `reset` writes an empty state file rather than deleting it, so the reset reaches every Mac.
+
+iCloud takes a few minutes to propagate, so schedule automatic syncs on one Mac; manual runs on the other are then safe.
+
 ## Config
 
 Edit `~/Library/Application Support/goodlinks2insta/config.json`:
@@ -120,6 +138,7 @@ Edit `~/Library/Application Support/goodlinks2insta/config.json`:
   "username": "your@email.com",
   "password": "...",
   "launch_goodlinks": true,
+  "include_read": false,
   "log_file": "~/Library/Logs/goodlinks2insta.log"
 }
 ```

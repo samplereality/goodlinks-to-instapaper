@@ -32,6 +32,7 @@ import logging
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 from pathlib import Path
 
@@ -45,11 +46,18 @@ DEFAULT_SYNC_DELAY = 5  # Seconds to wait for iCloud sync after launching GoodLi
 
 # Read version from pyproject.toml
 def get_version():
-    """Get version from pyproject.toml."""
-    import tomllib
-    with open("pyproject.toml", "rb") as f:
-        data = tomllib.load(f)
-    return data["project"]["version"]
+    """Get version from installed package metadata, else pyproject.toml next to this file."""
+    try:
+        from importlib.metadata import version
+        return version("goodlinks2insta")
+    except Exception:
+        pass
+    try:
+        import tomllib
+        with open(Path(__file__).with_name("pyproject.toml"), "rb") as f:
+            return tomllib.load(f)["project"]["version"]
+    except Exception:
+        return "unknown"
 
 __version__ = get_version()
 
@@ -135,17 +143,42 @@ def ensure_goodlinks_running(launch_if_needed: bool, sync_delay: int) -> bool:
     return False
 
 
+FIELD_SEP = "\x1f"  # ASCII unit separator (safe inside titles)
+RECORD_SEP = "\x1e"  # ASCII record separator
+
+
+def normalize_url(url: str) -> str:
+    """Loose URL key for duplicate detection: host (no www/mobile) + path, no query."""
+    s = urlsplit(url.strip())
+    host = (s.hostname or "").lower()
+    for prefix in ("www.", "mobile.", "m."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    return host + s.path.rstrip("/")
+
+
 def get_goodlinks():
-    """Get all links from GoodLinks via AppleScript."""
+    """Get all links from GoodLinks via AppleScript.
+
+    Each link: id, url, title, read (bool), age (position in GoodLinks'
+    list, which is newest-saved first, so a larger age means saved earlier).
+    GoodLinks' AppleScript dictionary has no date properties.
+    """
     script = """
     tell application "GoodLinks"
-        set output to ""
-        set allLinks to every link
-        repeat with l in allLinks
-            set output to output & id of l & "\t" & url of l & "\t" & title of l & "\\n"
-        end repeat
-        return output
+        set theIds to id of every link
+        set theUrls to url of every link
+        set theReads to read of every link
+        set theTitles to title of every link
     end tell
+    set fs to character id 31
+    set rs to character id 30
+    set output to {}
+    repeat with i from 1 to count of theIds
+        set end of output to ((item i of theIds) as text) & fs & ((item i of theUrls) as text) & fs & ((item i of theReads) as text) & fs & ((item i of theTitles) as text)
+    end repeat
+    set AppleScript's text item delimiters to rs
+    return output as text
     """
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if result.returncode != 0:
@@ -158,12 +191,57 @@ def get_goodlinks():
             raise RuntimeError(f"AppleScript failed: {result.stderr}")
 
     links = []
-    for line in result.stdout.strip().split("\n"):
-        if line:
-            parts = line.split("\t")
-            if len(parts) >= 3:
-                links.append({"id": parts[0], "url": parts[1], "title": parts[2]})
+    for position, record in enumerate(result.stdout.rstrip("\n").split(RECORD_SEP)):
+        parts = record.strip("\n").split(FIELD_SEP)
+        if len(parts) < 4 or not parts[0]:
+            continue
+        links.append(
+            {
+                "id": parts[0],
+                "url": parts[1],
+                "read": parts[2].strip().lower() == "true",
+                "age": position,
+                "title": FIELD_SEP.join(parts[3:]) or parts[1],
+            }
+        )
     return links
+
+
+def select_links_to_sync(links, synced, include_read, skip_url_keys=frozenset()):
+    """Decide what to send.
+
+    Returns (to_send, to_mark): to_send is oldest-saved first, so the newest
+    GoodLinks saves end up at the top of Instapaper; to_mark are links that
+    should be recorded as synced without sending (already in Instapaper).
+    """
+    to_send, to_mark = [], []
+    seen = set()
+    candidates = [l for l in links if l["id"] not in synced]
+    # oldest first (largest age first)
+    candidates.sort(key=lambda l: l["age"], reverse=True)
+    for link in candidates:
+        if link["read"] and not include_read:
+            continue
+        key = normalize_url(link["url"])
+        if key in skip_url_keys:
+            to_mark.append(link)
+            continue
+        if key in seen:
+            to_mark.append(link)  # duplicate URL within GoodLinks
+            continue
+        seen.add(key)
+        to_send.append(link)
+    return to_send, to_mark
+
+
+def load_skip_urls(path: Path):
+    """Read a file of URLs (one per line) already in Instapaper."""
+    keys = set()
+    for line in Path(path).expanduser().read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            keys.add(normalize_url(line))
+    return keys
 
 
 def load_synced_ids():
@@ -188,6 +266,7 @@ def load_config():
     config.setdefault("launch_goodlinks", True)
     config.setdefault("sync_delay", DEFAULT_SYNC_DELAY)
     config.setdefault("log_file", str(DEFAULT_LOG_FILE))
+    config.setdefault("include_read", False)
     return config
 
 
@@ -317,15 +396,30 @@ def cmd_sync(args):
 
         links = get_goodlinks()
         synced = load_synced_ids()
-        to_sync = [l for l in links if l["id"] not in synced]
+        include_read = args.include_read or config["include_read"]
+        skip_keys = load_skip_urls(args.skip_urls) if args.skip_urls else frozenset()
+        to_sync, to_mark = select_links_to_sync(links, synced, include_read, skip_keys)
 
-        log.info(f"Found {len(to_sync)} new links to sync (of {len(links)} total)")
+        unread = sum(1 for l in links if not l["read"])
+        log.info(
+            f"Found {len(to_sync)} new links to sync "
+            f"({len(links)} in GoodLinks, {unread} unread; "
+            f"{'including' if include_read else 'skipping'} read links)"
+        )
+        if to_mark:
+            log.info(f"{len(to_mark)} links are already in Instapaper or duplicates; marking as synced without sending")
 
         if args.dry_run:
             for link in to_sync:
                 log.info(f"  Would sync: {link['title'][:70]}")
-            log.info(f"Would sync {len(to_sync)} links")
+            for link in to_mark:
+                log.info(f"  Would skip (already there): {link['title'][:60]}")
+            log.info(f"Would sync {len(to_sync)} links, oldest first")
             return
+
+        if to_mark:
+            synced.update(l["id"] for l in to_mark)
+            save_synced_ids(synced)
 
         if not to_sync:
             log.info("Nothing to sync")
@@ -333,8 +427,14 @@ def cmd_sync(args):
 
         new_count = 0
         failed_count = 0
+        last_add = 0.0
         for i, link in enumerate(to_sync, 1):
             title_short = link["title"][:60]
+            # Instapaper timestamps are whole seconds; keep adds >=1s apart
+            wait = 1.05 - (time.monotonic() - last_add)
+            if wait > 0:
+                time.sleep(wait)
+            last_add = time.monotonic()
             if add_to_instapaper(
                 link["url"], link["title"], username, password, max_retries=args.max_retries
             ):
@@ -365,9 +465,10 @@ def cmd_status(args):
     """Show sync status."""
     links = get_goodlinks()
     synced = load_synced_ids()
-    unsynced = [l for l in links if l["id"] not in synced]
+    include_read = load_config().get("include_read", False) if CONFIG_FILE.exists() else False
+    unsynced, _ = select_links_to_sync(links, synced, include_read)
 
-    print(f"GoodLinks: {len(links)} links")
+    print(f"GoodLinks: {len(links)} links ({sum(1 for l in links if not l['read'])} unread)")
     print(f"Synced:    {len(synced)}")
     print(f"Pending:   {len(unsynced)}")
 
@@ -425,6 +526,16 @@ def main():
         help="suppress console output (for background runs)",
     )
     sync_parser.add_argument(
+        "--include-read",
+        action="store_true",
+        help="also send links already marked read in GoodLinks",
+    )
+    sync_parser.add_argument(
+        "--skip-urls",
+        metavar="FILE",
+        help="file of URLs already in Instapaper; matching links are marked synced, not sent",
+    )
+    sync_parser.add_argument(
         "-r",
         "--max-retries",
         type=int,
@@ -452,6 +563,8 @@ def main():
         args.dry_run = False
         args.quiet = False
         args.max_retries = 3
+        args.include_read = False
+        args.skip_urls = None
         cmd_sync(args)
     else:
         args.func(args)
