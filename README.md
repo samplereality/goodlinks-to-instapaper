@@ -8,12 +8,14 @@ This is an unofficial app and not endorsed by GoodLinks or Instapaper.
 
 ```bash
 # Clone the repository
-git clone https://github.com/elidickinson/goodlinks-to-instapaper.git
+git clone https://github.com/samplereality/goodlinks-to-instapaper.git
 cd goodlinks-to-instapaper
 
 # Install as a uv tool
 uv tool install .
 ```
+
+After pulling changes, reinstall with `uv tool install --force --reinstall .` (without `--reinstall`, uv may keep using a cached build).
 
 After installation, you can run `goodlinks2insta` from anywhere:
 
@@ -58,12 +60,53 @@ This creates a config at `~/Library/Application Support/goodlinks2insta/config.j
 
 ## Usage
 
+### Typical commands
+
 ```bash
-goodlinks2insta              # sync new links
-goodlinks2insta status       # show sync status
-goodlinks2insta sync -n      # dry run (show what would sync)
-goodlinks2insta reset        # reset state (re-sync everything)
+goodlinks2insta sync --dry-run   # preview: list what would be sent, send nothing
+goodlinks2insta sync             # send new unread links to Instapaper
+goodlinks2insta status           # counts, state file location, next links pending
+goodlinks2insta sync --quiet     # for scheduled runs: log to file only
 ```
+
+Running `goodlinks2insta` with no command is the same as `goodlinks2insta sync`.
+
+Starting over (for example after clearing Instapaper), with a list of URLs that are already there:
+
+```bash
+goodlinks2insta reset
+goodlinks2insta sync --dry-run --skip-urls instapaper-urls.txt   # check first
+goodlinks2insta sync --skip-urls instapaper-urls.txt
+```
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `init` | Prompts for your Instapaper email and password and writes the config file. `--force` / `-f` overwrites an existing config. |
+| `sync` | Sends new links to Instapaper (the default command). Takes the flags below. |
+| `status` | Shows how many links GoodLinks has, how many are recorded as synced, where the state file is, and the first pending links. |
+| `reset` | Empties the sync record, so the next `sync` treats every eligible link as new. |
+| `version` | Prints the version (same as `goodlinks2insta --version` or `-v`). |
+
+### `sync` flags
+
+Flags apply to a single run only; they never change the config file.
+
+| Flag | What it does | Config equivalent |
+|---|---|---|
+| `-n`, `--dry-run` | List what would be sent and skipped, then stop. Sends nothing and doesn't update the state file. | none |
+| `-q`, `--quiet` | No console output; messages go only to the log file. Use for scheduled runs. | none |
+| `--include-read` | Also send links already marked read in GoodLinks. | `"include_read": true` turns this on for every run |
+| `--skip-urls FILE` | FILE lists URLs already in Instapaper, one per line (`#` starts a comment). GoodLinks links with matching URLs are recorded as synced without being sent. Matching ignores `http`/`https`, `www.`, query strings and trailing slashes. | none |
+| `--allow-full-sync` | Send even when no state file exists at all (normally refused above 25 links, as a safeguard). Not needed after `reset`. | none |
+| `-r N`, `--max-retries N` | Retries per link on network or server errors (default 3). | none |
+
+## How flags and the config file relate
+
+- The **config file** holds settings that stay the same from run to run: your Instapaper login, whether to open GoodLinks, where to log, where the state file lives, and whether read links are included.
+- **Flags** change one run. The only setting that exists in both places is read links: `--include-read` turns it on for one run even when the config says `"include_read": false`. (No flag turns it off when the config has it on.)
+- The **state file** (`synced.json`) is neither: it's the tool's record of which GoodLinks links have been sent. `sync` adds to it, `reset` empties it, and `--dry-run` leaves it alone.
 
 ## Background Sync (every 3 hours)
 
@@ -131,19 +174,30 @@ iCloud takes a few minutes to propagate, so schedule automatic syncs on one Mac;
 
 ## Config
 
-Edit `~/Library/Application Support/goodlinks2insta/config.json`:
+`goodlinks2insta init` creates `~/Library/Application Support/goodlinks2insta/config.json`. Edit it to change these settings:
 
 ```json
 {
   "username": "your@email.com",
   "password": "...",
   "launch_goodlinks": true,
+  "sync_delay": 5,
   "include_read": false,
-  "log_file": "~/Library/Logs/goodlinks2insta.log"
+  "log_file": "~/Library/Logs/goodlinks2insta.log",
+  "state_file": "~/Library/Mobile Documents/com~apple~CloudDocs/goodlinks2insta/synced.json"
 }
 ```
 
-Set `launch_goodlinks` to `false` if you don't want the script to automatically open GoodLinks when it's not running.
+| Key | Default | What it does |
+|---|---|---|
+| `username`, `password` | (set by `init`) | Your Instapaper login. Required. |
+| `launch_goodlinks` | `true` | Open GoodLinks in the background if it isn't running (and quit it afterward). If `false`, the sync is skipped when GoodLinks isn't open. |
+| `sync_delay` | `5` | Seconds to wait after launching GoodLinks so it can pull new links from iCloud. |
+| `include_read` | `false` | Also send links already marked read in GoodLinks. |
+| `log_file` | `~/Library/Logs/goodlinks2insta.log` | Where every run is logged, including `--quiet` runs. |
+| `state_file` | iCloud Drive `goodlinks2insta/synced.json` (or `~/Library/Application Support/goodlinks2insta/synced.json` without iCloud Drive) | Where the record of sent links is kept. |
+
+Only `username` and `password` are required; leave out any other key to use its default. The config file is per Mac and isn't shared through iCloud, so run `init` on each Mac.
 
 ## Uninstalling the tool
 
