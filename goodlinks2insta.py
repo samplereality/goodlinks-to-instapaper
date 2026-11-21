@@ -39,8 +39,64 @@ from pathlib import Path
 import requests
 
 APP_DIR = Path("~/Library/Application Support/goodlinks2insta").expanduser()
-STATE_FILE = APP_DIR / "synced.json"
+LEGACY_STATE_FILE = APP_DIR / "synced.json"
+ICLOUD_DIR = Path("~/Library/Mobile Documents/com~apple~CloudDocs").expanduser()
 CONFIG_FILE = APP_DIR / "config.json"
+# Bulk sends from a missing state file need --allow-full-sync above this many links
+FULL_SYNC_GUARD = 25
+
+
+def default_state_file() -> Path:
+    """Shared state in iCloud Drive when available, so every Mac knows what was sent."""
+    if ICLOUD_DIR.is_dir():
+        return ICLOUD_DIR / "goodlinks2insta" / "synced.json"
+    return LEGACY_STATE_FILE
+
+
+STATE_FILE = default_state_file()
+
+
+def resolve_state_file(config: dict | None):
+    """Pick the state file (config "state_file" overrides) and prepare it."""
+    global STATE_FILE
+    if config and config.get("state_file"):
+        STATE_FILE = Path(config["state_file"]).expanduser()
+    else:
+        STATE_FILE = default_state_file()
+        if STATE_FILE == LEGACY_STATE_FILE:
+            log.warning(
+                "iCloud Drive isn't available on this Mac, so the sync record is local "
+                f"({STATE_FILE}). To share it with other Macs, set \"state_file\" in "
+                f"{CONFIG_FILE} to a synced folder (e.g. Dropbox)."
+            )
+    ensure_state_downloaded()
+    # One-time move: seed shared state from this Mac's old local file
+    if (
+        STATE_FILE != LEGACY_STATE_FILE
+        and not STATE_FILE.exists()
+        and LEGACY_STATE_FILE.exists()
+    ):
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(LEGACY_STATE_FILE.read_text())
+        LEGACY_STATE_FILE.rename(LEGACY_STATE_FILE.with_name("synced.json.migrated"))
+        log.info(f"Moved sync state to {STATE_FILE}")
+
+
+def ensure_state_downloaded(timeout: int = 60):
+    """If iCloud has evicted the file to a placeholder, download it before use."""
+    placeholder = STATE_FILE.with_name(f".{STATE_FILE.name}.icloud")
+    if STATE_FILE.exists() or not placeholder.exists():
+        return
+    log.info("Downloading sync state from iCloud...")
+    subprocess.run(["brctl", "download", str(STATE_FILE)], capture_output=True)
+    for _ in range(timeout):
+        if STATE_FILE.exists():
+            return
+        time.sleep(1)
+    raise RuntimeError(
+        f"Sync state is in iCloud but did not download: {STATE_FILE}\n"
+        "Open that folder in Finder to download it, then run the sync again"
+    )
 DEFAULT_LOG_FILE = Path("~/Library/Logs/goodlinks2insta.log").expanduser()
 DEFAULT_SYNC_DELAY = 5  # Seconds to wait for iCloud sync after launching GoodLinks
 
@@ -251,8 +307,16 @@ def load_synced_ids():
 
 
 def save_synced_ids(ids):
+    """Save state, merging with whatever another Mac may have written meanwhile."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(list(ids)))
+    merged = set(ids)
+    try:
+        merged |= load_synced_ids()
+    except (OSError, ValueError):
+        pass
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(sorted(merged)))
+    tmp.replace(STATE_FILE)
 
 
 def load_config():
@@ -394,6 +458,7 @@ def cmd_sync(args):
         username = config["username"]
         password = config["password"]
 
+        state_existed = STATE_FILE.exists()
         links = get_goodlinks()
         synced = load_synced_ids()
         include_read = args.include_read or config["include_read"]
@@ -415,6 +480,15 @@ def cmd_sync(args):
             for link in to_mark:
                 log.info(f"  Would skip (already there): {link['title'][:60]}")
             log.info(f"Would sync {len(to_sync)} links, oldest first")
+            return
+
+        if not state_existed and len(to_sync) > FULL_SYNC_GUARD and not args.allow_full_sync:
+            log.error(
+                f"No sync state found at {STATE_FILE}, so all {len(to_sync)} links look new.\n"
+                "Refusing to send them in case they are already in Instapaper.\n"
+                "If you really want a full sync, run 'goodlinks2insta reset' first "
+                "or pass --allow-full-sync"
+            )
             return
 
         if to_mark:
@@ -469,6 +543,7 @@ def cmd_status(args):
     unsynced, _ = select_links_to_sync(links, synced, include_read)
 
     print(f"GoodLinks: {len(links)} links ({sum(1 for l in links if not l['read'])} unread)")
+    print(f"State:     {STATE_FILE}")
     print(f"Synced:    {len(synced)}")
     print(f"Pending:   {len(unsynced)}")
 
@@ -482,11 +557,11 @@ def cmd_status(args):
 
 def cmd_reset(args):
     """Reset sync state (mark all as unsynced)."""
-    if STATE_FILE.exists():
-        STATE_FILE.unlink()
-        print("Sync state reset")
-    else:
-        print("No sync state to reset")
+    # Write an empty list rather than deleting, so the next sync knows the
+    # full re-send is intended (and other Macs see the reset too).
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text("[]")
+    print(f"Sync state reset ({STATE_FILE})")
 
 
 def cmd_version(args):
@@ -526,6 +601,11 @@ def main():
         help="suppress console output (for background runs)",
     )
     sync_parser.add_argument(
+        "--allow-full-sync",
+        action="store_true",
+        help="send everything even when no sync state file exists",
+    )
+    sync_parser.add_argument(
         "--include-read",
         action="store_true",
         help="also send links already marked read in GoodLinks",
@@ -558,6 +638,15 @@ def main():
 
     args = parser.parse_args()
 
+    if args.command not in ("init", "version"):
+        config = None
+        if CONFIG_FILE.exists():
+            try:
+                config = json.loads(CONFIG_FILE.read_text())
+            except ValueError:
+                pass
+        resolve_state_file(config)
+
     if args.command is None:
         # Default to sync
         args.dry_run = False
@@ -565,6 +654,7 @@ def main():
         args.max_retries = 3
         args.include_read = False
         args.skip_urls = None
+        args.allow_full_sync = False
         cmd_sync(args)
     else:
         args.func(args)
